@@ -1,0 +1,13 @@
+.env
+.env.*
+!.env.example
+data/
+logs/
+*.db
+*.sqlite
+*.sqlite3
+node_modules/
+dist/
+build/
+*.tsbuildinfo
+.DS_Store

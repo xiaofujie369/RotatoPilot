@@ -1,0 +1,45 @@
+services:
+  controller:
+    image: ${CONTROLLER_IMAGE:-ghcr.io/xiaofujie369/rotatopilot-controller:latest}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: rotatopilot-controller
+    restart: unless-stopped
+    env_file: [.env]
+    ports:
+      - "${APP_PORT:-8080}:8080"
+    volumes:
+      - rotatopilot-data:/app/data
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  agent:
+    profiles: [agent]
+    image: ${AGENT_IMAGE:-ghcr.io/xiaofujie369/rotatopilot-agent:latest}
+    build:
+      context: .
+      dockerfile: agent/Dockerfile
+    restart: unless-stopped
+    env_file: [agent.env]
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=8m
+    # Optional: uncomment to report Docker availability.
+    # volumes:
+    #   - /var/run/docker.sock:/var/run/docker.sock:ro
+
+volumes:
+  rotatopilot-data:

@@ -1,0 +1,2033 @@
+# DESIGN.md
+
+# Project: Auto IP Rotator Platform
+
+## 1. Project Goal
+
+Build a professional web-based Auto IP Rotation Platform for AWS Lightsail-like VPS panels.
+
+The platform allows the user to configure provider panel credentials, server IDs, probe rules, and optional DNS/DDNS synchronization from a web dashboard. After configuration, the dashboard generates a one-line Agent installation command. The user runs this command on the target AWS VPS. The Agent then registers itself to the platform, reports network status, performs local checks, receives tasks, and helps the platform automatically rotate IPs and synchronize DNS records.
+
+The system must be Docker-based, production-ready, secure, and easy to deploy.
+
+---
+
+## 2. Main Use Case
+
+The user owns AWS VPS instances managed through a third-party panel API.
+
+The user wants:
+
+1. A web dashboard.
+2. A place to save panel API address, panel token, and machine ID.
+3. A generated one-click Agent install command.
+4. Agent installed on the target AWS VPS.
+5. The Agent automatically reports VPS information.
+6. The platform checks whether the VPS IP is reachable.
+7. If the IP is blocked or unreachable according to configured probe rules, the platform calls the panel API to change the IP.
+8. After IP change, the platform optionally updates DNS/DDNS records.
+9. Dashboard updates status in real time through WebSocket.
+10. Telegram notification support.
+
+---
+
+## 3. Important Design Change
+
+The old design required manually editing `.env` on the server.
+
+The new design must use a web-first configuration model:
+
+```text
+Dashboard writes configuration into database
+↓
+Dashboard generates Agent install command
+↓
+User runs command on AWS VPS
+↓
+Agent registers with dashboard
+↓
+Dashboard controls checking, IP rotation, DNS sync, and notifications
+```
+
+The Agent itself should not require the panel token directly unless absolutely necessary.
+
+Preferred security model:
+
+```text
+Panel token is stored only on the central controller.
+Agent receives only an Agent registration token.
+Controller calls provider API to change IP.
+Agent only reports local status and executes safe local checks.
+```
+
+This prevents leaking the provider panel token to every VPS.
+
+---
+
+## 4. Terminology
+
+### Controller
+
+The central web platform.
+
+Responsibilities:
+
+- Web dashboard
+- User login
+- Stores provider panel config
+- Stores server config
+- Generates Agent install commands
+- Receives Agent heartbeats
+- Runs scheduled probes
+- Calls provider API to rotate IP
+- Syncs DNS/DDNS
+- Sends Telegram notifications
+- Broadcasts live status via WebSocket
+
+### Agent
+
+A lightweight service installed on the AWS VPS.
+
+Responsibilities:
+
+- Register itself with Controller
+- Report public IP
+- Report local network status
+- Run local TCP/HTTP/ICMP checks
+- Report service health
+- Optionally restart local services after IP rotation
+- Receive tasks from Controller
+- Never expose provider panel token
+
+### Provider Panel
+
+The VPS management panel API.
+
+Example:
+
+```text
+https://aws.linus.us.kg
+```
+
+Used endpoints:
+
+```http
+POST /lb/lightsail/page
+POST /lb/lightsail/changeIp
+```
+
+### DNS Provider
+
+Optional DNS synchronization provider.
+
+Initial supported providers:
+
+1. Cloudflare
+2. DNSPod, optional later
+3. AliDNS, optional later
+4. Generic webhook DDNS, optional later
+
+---
+
+## 5. High-Level Architecture
+
+```text
++-----------------------------+
+| User Browser                |
+| React Dashboard             |
++--------------+--------------+
+               |
+               | HTTPS / WebSocket
+               |
++--------------v--------------+
+| Controller Backend          |
+| Go / Node.js API            |
+| Scheduler                   |
+| Provider Client             |
+| DNS Sync Client             |
+| Agent Manager               |
+| WebSocket Hub               |
++--------------+--------------+
+               |
+               | SQLite / PostgreSQL
+               |
++--------------v--------------+
+| Database                    |
++-----------------------------+
+
+               ^
+               |
+               | HTTPS Agent API
+               |
++--------------+--------------+
+| AWS VPS Agent               |
+| Docker container / systemd  |
+| Local checks / heartbeat    |
++-----------------------------+
+
+Optional external probes:
+
++-----------------------------+
+| External Probe Node         |
+| China/HK/JP/US probe        |
++-----------------------------+
+```
+
+---
+
+## 6. Deployment Model
+
+### Controller Deployment
+
+The Controller should be deployed using Docker Compose.
+
+Example:
+
+```bash
+git clone https://github.com/OWNER/auto-ip-rotator.git
+cd auto-ip-rotator
+cp .env.example .env
+docker compose up -d
+```
+
+The Controller exposes:
+
+```text
+http://SERVER_IP:8080
+```
+
+or behind Caddy/Nginx:
+
+```text
+https://rotator.example.com
+```
+
+### Agent Deployment
+
+The Agent is installed from the dashboard-generated command.
+
+Example command generated by dashboard:
+
+```bash
+bash <(curl -fsSL https://rotator.example.com/install-agent.sh) \
+  --controller https://rotator.example.com \
+  --agent-token air_xxxxxxxxxxxxxxxxx \
+  --server-id 1783916711346432
+```
+
+Alternative Docker command:
+
+```bash
+docker run -d \
+  --name auto-ip-agent \
+  --restart unless-stopped \
+  -e CONTROLLER_URL="https://rotator.example.com" \
+  -e AGENT_TOKEN="air_xxxxxxxxxxxxxxxxx" \
+  -e SERVER_ID="1783916711346432" \
+  -v /var/run/docker.sock:/var/run/docker.sock:ro \
+  ghcr.io/OWNER/auto-ip-agent:latest
+```
+
+The dashboard must show both install options.
+
+---
+
+## 7. Web Dashboard Configuration Flow
+
+### Step 1: Create Provider Panel
+
+The user enters provider panel information in the web UI:
+
+```text
+Provider Name: Linus AWS Panel
+API Base URL: https://aws.linus.us.kg
+Authorization Token: ********
+Token Type: Raw Authorization Header
+```
+
+Important:
+
+The token must be encrypted at rest.
+
+Do not store tokens in plaintext if possible.
+
+Recommended:
+
+```text
+APP_ENCRYPTION_KEY
+```
+
+Use this key to encrypt sensitive fields in the database.
+
+### Step 2: Test Provider Connection
+
+The dashboard has a button:
+
+```text
+Test Connection
+```
+
+The backend calls:
+
+```http
+POST /lb/lightsail/page
+Authorization: <TOKEN>
+Content-Type: application/json
+```
+
+Body:
+
+```json
+{
+  "offset": 0,
+  "limit": 100,
+  "keyword": "",
+  "remark": "",
+  "groupName": ""
+}
+```
+
+If successful, show discovered machines.
+
+### Step 3: Add Machine
+
+The user can select a machine from discovered list or manually enter:
+
+```text
+Machine ID: 1783916711346432
+Name: Tokyo AWS VPS 1
+Region: Tokyo
+Expected Service Port: 443
+Auto Rotate: disabled by default
+```
+
+Machine ID must be stored as string, not integer.
+
+### Step 4: Generate Agent
+
+After saving the machine, dashboard generates:
+
+```text
+Agent Token
+Install Command
+Docker Command
+```
+
+Agent token should be scoped to one machine.
+
+Example:
+
+```text
+air_01Jxxxxxxxxxxxxxxxx
+```
+
+Agent token permissions:
+
+```text
+agent:register
+agent:heartbeat
+agent:report
+agent:task:read
+agent:task:result
+```
+
+Agent token must not be able to call provider API or DNS API directly.
+
+### Step 5: Agent Installation
+
+User runs the one-line command on the AWS VPS.
+
+The Agent starts and calls:
+
+```http
+POST /api/agent/register
+```
+
+Then the dashboard shows:
+
+```text
+Agent Online
+Current IP
+Hostname
+OS
+Docker status
+Last heartbeat
+```
+
+### Step 6: Optional DNS Sync
+
+The user can configure DNS later.
+
+Fields:
+
+```text
+DNS Provider: Cloudflare
+API Token: ********
+Zone ID: ********
+Record Name: jp.example.com
+Record Type: A
+Proxied: false
+Sync After IP Change: true
+```
+
+DNS sync is optional and must be disabled by default.
+
+---
+
+## 8. Provider Panel API
+
+The platform must support the current panel API.
+
+### List Machines
+
+```http
+POST /lb/lightsail/page
+Authorization: <TOKEN>
+Content-Type: application/json
+```
+
+Request body:
+
+```json
+{
+  "offset": 0,
+  "limit": 100,
+  "keyword": "",
+  "remark": "",
+  "groupName": ""
+}
+```
+
+Expected response may contain:
+
+```json
+{
+  "list": [
+    {
+      "id": "1783916711346432",
+      "publicIpAddress": "13.115.96.246",
+      "ipv6Address": "2406:da14:1562:3c00:bf5b:8ab4:c89e:87a8",
+      "region": "东京",
+      "status": "running",
+      "remark": "",
+      "traffic": "835.96G/2048G"
+    }
+  ]
+}
+```
+
+The implementation must be tolerant of response field changes.
+
+### Change IP
+
+```http
+POST /lb/lightsail/changeIp
+Authorization: <TOKEN>
+Content-Type: application/json
+```
+
+Request body:
+
+```json
+{
+  "id": "1783916711346432"
+}
+```
+
+After calling change IP, the backend must poll the list API until the IP changes or timeout.
+
+---
+
+## 9. Agent Design
+
+### Agent Responsibilities
+
+The Agent must:
+
+1. Register itself with Controller.
+2. Send heartbeat every 30 seconds.
+3. Report local public IPv4 and IPv6.
+4. Report hostname, OS, kernel, uptime, and Docker availability.
+5. Run local probes requested by Controller.
+6. Report local service port listening status.
+7. Optionally run post-rotation commands.
+8. Optionally restart services after IP change.
+9. Not store panel token.
+10. Not store DNS provider token.
+
+### Agent Registration
+
+Endpoint:
+
+```http
+POST /api/agent/register
+Authorization: Agent <AGENT_TOKEN>
+Content-Type: application/json
+```
+
+Body:
+
+```json
+{
+  "serverId": "1783916711346432",
+  "hostname": "ip-172-26-13-241",
+  "agentVersion": "1.0.0",
+  "os": "Debian 12",
+  "arch": "amd64",
+  "publicIPv4": "13.115.96.246",
+  "publicIPv6": "2406:da14:1562:3c00:..."
+}
+```
+
+Response:
+
+```json
+{
+  "ok": true,
+  "agentId": "agt_01Jxxxx",
+  "config": {
+    "heartbeatIntervalSeconds": 30,
+    "taskPollIntervalSeconds": 15
+  }
+}
+```
+
+### Agent Heartbeat
+
+```http
+POST /api/agent/heartbeat
+Authorization: Agent <AGENT_TOKEN>
+Content-Type: application/json
+```
+
+Body:
+
+```json
+{
+  "serverId": "1783916711346432",
+  "publicIPv4": "13.115.96.246",
+  "publicIPv6": "2406:da14:1562:3c00:...",
+  "uptimeSeconds": 102400,
+  "loadAvg": [0.05, 0.03, 0.01],
+  "dockerRunning": true,
+  "timestamp": "2026-06-29T12:00:00Z"
+}
+```
+
+### Agent Task Polling
+
+```http
+GET /api/agent/tasks
+Authorization: Agent <AGENT_TOKEN>
+```
+
+Response:
+
+```json
+{
+  "tasks": [
+    {
+      "taskId": "task_01Jxxx",
+      "type": "tcp_probe",
+      "targetHost": "13.115.96.246",
+      "targetPort": 443,
+      "timeoutMs": 3000
+    }
+  ]
+}
+```
+
+### Agent Task Result
+
+```http
+POST /api/agent/tasks/result
+Authorization: Agent <AGENT_TOKEN>
+Content-Type: application/json
+```
+
+Body:
+
+```json
+{
+  "taskId": "task_01Jxxx",
+  "success": true,
+  "latencyMs": 35,
+  "error": "",
+  "finishedAt": "2026-06-29T12:00:03Z"
+}
+```
+
+---
+
+## 10. Probe System
+
+The system must support three levels of probes.
+
+### Level 1: Controller Probe
+
+The Controller checks target IP/domain from the Controller machine.
+
+Supported types:
+
+```text
+TCP
+HTTP/HTTPS
+ICMP optional
+```
+
+### Level 2: Agent Local Probe
+
+The Agent checks local service status on the VPS.
+
+Examples:
+
+```text
+Is port 443 listening?
+Is Docker running?
+Is xray-core container running?
+Can the VPS access public internet?
+```
+
+This does not prove China reachability, but helps determine whether the VPS service is healthy.
+
+### Level 3: External Probe Node
+
+Optional additional Agent installed on another region.
+
+Example:
+
+```text
+HK probe
+JP probe
+US probe
+China-friendly probe
+```
+
+External probes check the VPS from outside.
+
+This is the most reliable model for detecting blocking.
+
+---
+
+## 11. Detection Strategy
+
+Do not rotate IP based on a single failed ping.
+
+Use weighted scoring.
+
+Example default:
+
+```text
+Controller TCP 443 failed: weight 2
+Controller HTTPS failed: weight 2
+Agent local port 443 not listening: weight 3
+External HK TCP failed: weight 2
+External China HTTP failed: weight 5
+ICMP failed: weight 1
+```
+
+Default rule:
+
+```text
+If failure score >= 5 for 3 consecutive checks, mark server as suspect.
+If confirmation check also fails, mark server as blocked/unhealthy.
+If auto rotation is enabled and cooldown passed, rotate IP.
+```
+
+Configuration:
+
+```text
+Check interval: 300 seconds
+Failure threshold: 3
+Confirmation check: enabled
+Cooldown: 30 minutes
+Max rotations per day: 10
+Auto rotation: disabled by default
+```
+
+---
+
+## 12. IP Rotation Workflow
+
+The Controller handles IP rotation.
+
+```text
+1. Lock the server rotation job.
+2. Fetch current IP from provider panel.
+3. Run confirmation probes.
+4. Check cooldown.
+5. Check daily rotation limit.
+6. Call provider changeIp API.
+7. Wait configured seconds.
+8. Poll provider list API until new IP appears.
+9. Save old IP and new IP.
+10. Notify Agent that IP has changed.
+11. Run post-change probes.
+12. Sync DNS if enabled.
+13. Send Telegram notification.
+14. Broadcast WebSocket event.
+15. Unlock rotation job.
+```
+
+The Agent should not call the provider change IP endpoint directly by default.
+
+---
+
+## 13. DNS / DDNS Sync Design
+
+DNS sync must be optional.
+
+The dashboard must allow the user to fill DNS config later.
+
+### Supported DNS Providers
+
+MVP:
+
+```text
+Cloudflare
+```
+
+Planned:
+
+```text
+DNSPod
+AliDNS
+Generic webhook
+```
+
+### DNS Config UI
+
+Fields:
+
+```text
+DNS Provider
+API Token
+Zone ID
+Record Name
+Record Type: A / AAAA
+Proxied: true / false
+TTL
+Bind to Machine ID
+Sync after IP rotation: enabled / disabled
+```
+
+### Cloudflare Sync
+
+After IP change:
+
+```text
+Old IP: 13.115.96.246
+New IP: 18.183.xxx.xxx
+Record: jp.example.com
+Action: update A record to 18.183.xxx.xxx
+```
+
+Default:
+
+```text
+Proxied: false
+```
+
+Reason:
+
+For proxy node domains, Cloudflare proxy can break direct TCP/VLESS/Reality/TLS connections unless intentionally used.
+
+### Generic Webhook DDNS
+
+Support a generic webhook provider.
+
+Example:
+
+```text
+Webhook URL:
+https://example.com/ddns/update?token=xxx&domain={domain}&ip={ip}
+
+Method:
+GET or POST
+
+Headers:
+Authorization: Bearer xxx
+```
+
+Template variables:
+
+```text
+{ip}
+{ipv6}
+{domain}
+{server_id}
+{old_ip}
+{new_ip}
+```
+
+---
+
+## 14. WebSocket Real-Time Sync
+
+Frontend must use WebSocket to update status without refresh.
+
+Endpoint:
+
+```text
+/ws
+```
+
+Events:
+
+### Server Status
+
+```json
+{
+  "type": "server_status",
+  "data": {
+    "serverId": "1783916711346432",
+    "healthStatus": "healthy",
+    "publicIPv4": "13.115.96.246",
+    "agentOnline": true,
+    "lastCheckAt": "2026-06-29T12:00:00Z"
+  }
+}
+```
+
+### Agent Online
+
+```json
+{
+  "type": "agent_online",
+  "data": {
+    "serverId": "1783916711346432",
+    "agentId": "agt_01Jxxx",
+    "hostname": "aws-vps"
+  }
+}
+```
+
+### Probe Result
+
+```json
+{
+  "type": "probe_result",
+  "data": {
+    "serverId": "1783916711346432",
+    "probeType": "tcp",
+    "target": "13.115.96.246:443",
+    "success": true,
+    "latencyMs": 88
+  }
+}
+```
+
+### IP Changed
+
+```json
+{
+  "type": "ip_changed",
+  "data": {
+    "serverId": "1783916711346432",
+    "oldIp": "13.115.96.246",
+    "newIp": "18.183.xxx.xxx",
+    "dnsSynced": true
+  }
+}
+```
+
+### Job Log
+
+```json
+{
+  "type": "job_log",
+  "data": {
+    "level": "info",
+    "serverId": "1783916711346432",
+    "message": "IP rotation completed"
+  }
+}
+```
+
+---
+
+## 15. Dashboard Pages
+
+### 15.1 Login Page
+
+Simple admin login.
+
+Environment:
+
+```env
+ADMIN_USERNAME=admin
+ADMIN_PASSWORD=change_me
+JWT_SECRET=change_me
+```
+
+### 15.2 Overview Page
+
+Show:
+
+```text
+Total machines
+Online Agents
+Healthy machines
+Suspect machines
+Blocked machines
+Rotations today
+DNS sync success/fail
+Last global check
+```
+
+### 15.3 Provider Panels Page
+
+User can add:
+
+```text
+Provider name
+API base URL
+Token
+Token type
+Enable/disable
+```
+
+Actions:
+
+```text
+Test connection
+Sync machine list
+Edit
+Delete
+```
+
+### 15.4 Machines Page
+
+Show machine cards:
+
+```text
+Machine ID
+Name
+Region
+Current IPv4
+IPv6
+Provider status
+Agent status
+Health status
+Traffic
+Expire time
+Auto rotation
+Last check
+Last IP change
+```
+
+Actions:
+
+```text
+Generate Agent
+Check now
+Change IP now
+Sync DNS now
+View logs
+Edit probes
+Edit DNS
+```
+
+### 15.5 Agent Install Page
+
+For each machine, show:
+
+```text
+Agent status
+Agent token
+One-line install command
+Docker install command
+Last heartbeat
+Agent version
+Upgrade command
+```
+
+Buttons:
+
+```text
+Regenerate Agent Token
+Copy Install Command
+Copy Docker Command
+Revoke Agent
+```
+
+### 15.6 Probe Rules Page
+
+Allow user to configure probes.
+
+Fields:
+
+```text
+Probe name
+Machine ID
+Probe source: controller / agent / external-agent
+Type: TCP / HTTP / HTTPS / ICMP
+Host
+Port
+URL
+Expected HTTP status
+Timeout
+Interval
+Failure weight
+Enabled
+```
+
+### 15.7 DNS Sync Page
+
+Allow user to configure domain sync.
+
+Fields:
+
+```text
+Provider: Cloudflare / Generic Webhook
+Domain
+Record name
+Record type
+Zone ID
+Token
+Proxied
+TTL
+Bind machine ID
+Enabled
+```
+
+### 15.8 Rotation History Page
+
+Table:
+
+```text
+Time
+Machine ID
+Old IP
+New IP
+Trigger: auto/manual
+Reason
+DNS result
+Probe result
+Status
+Error
+```
+
+### 15.9 Logs Page
+
+Real-time logs.
+
+Filters:
+
+```text
+Machine ID
+Level
+Job type
+Time range
+```
+
+---
+
+## 16. Backend API Design
+
+### Auth
+
+```http
+POST /api/auth/login
+POST /api/auth/logout
+GET  /api/auth/me
+```
+
+### Provider Panels
+
+```http
+GET    /api/providers
+POST   /api/providers
+GET    /api/providers/:id
+PATCH  /api/providers/:id
+DELETE /api/providers/:id
+POST   /api/providers/:id/test
+POST   /api/providers/:id/sync-machines
+```
+
+### Machines
+
+```http
+GET    /api/machines
+POST   /api/machines
+GET    /api/machines/:id
+PATCH  /api/machines/:id
+DELETE /api/machines/:id
+POST   /api/machines/:id/check
+POST   /api/machines/:id/change-ip
+POST   /api/machines/:id/sync-dns
+POST   /api/machines/:id/generate-agent-token
+```
+
+### Agents
+
+```http
+POST /api/agent/register
+POST /api/agent/heartbeat
+GET  /api/agent/tasks
+POST /api/agent/tasks/result
+```
+
+Admin agent endpoints:
+
+```http
+GET    /api/agents
+GET    /api/agents/:id
+POST   /api/agents/:id/revoke
+POST   /api/agents/:id/upgrade-task
+```
+
+### Probes
+
+```http
+GET    /api/probes
+POST   /api/probes
+PATCH  /api/probes/:id
+DELETE /api/probes/:id
+POST   /api/probes/:id/run
+```
+
+### DNS
+
+```http
+GET    /api/dns-records
+POST   /api/dns-records
+PATCH  /api/dns-records/:id
+DELETE /api/dns-records/:id
+POST   /api/dns-records/:id/sync
+```
+
+### Rotation
+
+```http
+GET  /api/rotations
+GET  /api/rotations/:id
+POST /api/rotations/:id/retry-dns
+```
+
+### Logs
+
+```http
+GET /api/logs
+```
+
+### WebSocket
+
+```http
+GET /ws
+```
+
+---
+
+## 17. Database Schema
+
+Use SQLite by default.
+
+PostgreSQL can be supported later.
+
+### provider_panels
+
+```sql
+CREATE TABLE provider_panels (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  api_base_url TEXT NOT NULL,
+  token_encrypted TEXT NOT NULL,
+  token_type TEXT DEFAULT 'raw_authorization',
+  enabled INTEGER DEFAULT 1,
+  last_test_status TEXT,
+  last_test_error TEXT,
+  last_test_at TEXT,
+  created_at TEXT,
+  updated_at TEXT
+);
+```
+
+### machines
+
+```sql
+CREATE TABLE machines (
+  id TEXT PRIMARY KEY,
+  provider_id INTEGER NOT NULL,
+  name TEXT,
+  remark TEXT,
+  region TEXT,
+  status TEXT,
+  public_ipv4 TEXT,
+  public_ipv6 TEXT,
+  expected_port INTEGER DEFAULT 443,
+  auto_rotate_enabled INTEGER DEFAULT 0,
+  health_status TEXT DEFAULT 'unknown',
+  failure_count INTEGER DEFAULT 0,
+  success_count INTEGER DEFAULT 0,
+  last_check_at TEXT,
+  last_rotation_at TEXT,
+  rotation_cooldown_until TEXT,
+  traffic_text TEXT,
+  expire_time TEXT,
+  raw_provider_json TEXT,
+  created_at TEXT,
+  updated_at TEXT
+);
+```
+
+### agents
+
+```sql
+CREATE TABLE agents (
+  id TEXT PRIMARY KEY,
+  machine_id TEXT NOT NULL,
+  token_hash TEXT NOT NULL,
+  token_prefix TEXT NOT NULL,
+  name TEXT,
+  hostname TEXT,
+  agent_version TEXT,
+  os TEXT,
+  arch TEXT,
+  public_ipv4 TEXT,
+  public_ipv6 TEXT,
+  status TEXT DEFAULT 'offline',
+  last_heartbeat_at TEXT,
+  revoked INTEGER DEFAULT 0,
+  created_at TEXT,
+  updated_at TEXT
+);
+```
+
+### agent_tasks
+
+```sql
+CREATE TABLE agent_tasks (
+  id TEXT PRIMARY KEY,
+  agent_id TEXT NOT NULL,
+  machine_id TEXT NOT NULL,
+  type TEXT NOT NULL,
+  payload_json TEXT,
+  status TEXT DEFAULT 'pending',
+  result_json TEXT,
+  error TEXT,
+  created_at TEXT,
+  started_at TEXT,
+  finished_at TEXT
+);
+```
+
+### probe_configs
+
+```sql
+CREATE TABLE probe_configs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  machine_id TEXT NOT NULL,
+  name TEXT NOT NULL,
+  source TEXT NOT NULL,
+  type TEXT NOT NULL,
+  target_host TEXT,
+  target_port INTEGER,
+  url TEXT,
+  expected_status TEXT,
+  timeout_ms INTEGER DEFAULT 5000,
+  interval_seconds INTEGER DEFAULT 300,
+  failure_weight INTEGER DEFAULT 1,
+  enabled INTEGER DEFAULT 1,
+  created_at TEXT,
+  updated_at TEXT
+);
+```
+
+### probe_results
+
+```sql
+CREATE TABLE probe_results (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  machine_id TEXT NOT NULL,
+  probe_id INTEGER,
+  source TEXT,
+  probe_type TEXT,
+  target TEXT,
+  success INTEGER,
+  latency_ms INTEGER,
+  error TEXT,
+  checked_at TEXT
+);
+```
+
+### dns_providers
+
+```sql
+CREATE TABLE dns_providers (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  provider_type TEXT NOT NULL,
+  token_encrypted TEXT,
+  extra_config_json TEXT,
+  enabled INTEGER DEFAULT 1,
+  created_at TEXT,
+  updated_at TEXT
+);
+```
+
+### dns_records
+
+```sql
+CREATE TABLE dns_records (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  machine_id TEXT NOT NULL,
+  dns_provider_id INTEGER NOT NULL,
+  record_name TEXT NOT NULL,
+  record_type TEXT DEFAULT 'A',
+  zone_id TEXT,
+  proxied INTEGER DEFAULT 0,
+  ttl INTEGER DEFAULT 120,
+  enabled INTEGER DEFAULT 1,
+  sync_after_rotation INTEGER DEFAULT 1,
+  last_ip TEXT,
+  last_sync_status TEXT,
+  last_sync_error TEXT,
+  last_sync_at TEXT,
+  created_at TEXT,
+  updated_at TEXT
+);
+```
+
+### rotations
+
+```sql
+CREATE TABLE rotations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  machine_id TEXT NOT NULL,
+  old_ip TEXT,
+  new_ip TEXT,
+  trigger_type TEXT,
+  reason TEXT,
+  status TEXT,
+  dns_sync_status TEXT,
+  post_check_status TEXT,
+  error TEXT,
+  started_at TEXT,
+  finished_at TEXT
+);
+```
+
+### logs
+
+```sql
+CREATE TABLE logs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  level TEXT,
+  machine_id TEXT,
+  job_type TEXT,
+  message TEXT,
+  meta_json TEXT,
+  created_at TEXT
+);
+```
+
+---
+
+## 18. Security Requirements
+
+### Secrets
+
+Sensitive data:
+
+```text
+Provider panel token
+Cloudflare token
+DNSPod token
+AliDNS key
+Telegram bot token
+Agent token
+JWT secret
+```
+
+Must not be logged.
+
+Must not be returned to frontend after creation.
+
+Must be masked in UI:
+
+```text
+852b****6e94
+```
+
+### Encryption
+
+Use `APP_ENCRYPTION_KEY` to encrypt stored tokens.
+
+`.env.example`:
+
+```env
+APP_ENCRYPTION_KEY=change_me_32_bytes_random_string
+```
+
+### Agent Token
+
+Agent token must be shown only once when generated.
+
+Store only hash in database.
+
+Token format:
+
+```text
+air_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+```
+
+### Dashboard Security
+
+Default:
+
+```env
+ADMIN_USERNAME=admin
+ADMIN_PASSWORD=change_me_now
+JWT_SECRET=change_me_now
+```
+
+The UI must force changing default password on first login if still default.
+
+### Public Exposure
+
+README must warn:
+
+```text
+Do not expose dashboard publicly without HTTPS and strong password.
+Do not commit .env.
+Rotate provider token if leaked.
+Use least-privilege DNS API tokens.
+Keep auto rotation disabled until probes are tested.
+```
+
+---
+
+## 19. Install Script Requirements
+
+### Controller Install
+
+Create:
+
+```text
+install-controller.sh
+```
+
+Usage:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/OWNER/auto-ip-rotator/main/install-controller.sh)
+```
+
+The script should:
+
+1. Install Docker if missing.
+2. Install Docker Compose if missing.
+3. Create `/opt/auto-ip-rotator`.
+4. Download `docker-compose.yml`.
+5. Generate `.env`.
+6. Ask for:
+   - Dashboard port
+   - Admin username
+   - Admin password
+   - Public dashboard URL
+7. Start services.
+8. Print login URL.
+
+### Agent Install
+
+Create:
+
+```text
+install-agent.sh
+```
+
+Usage generated by dashboard:
+
+```bash
+bash <(curl -fsSL https://rotator.example.com/install-agent.sh) \
+  --controller https://rotator.example.com \
+  --agent-token air_xxxxxxxxxxxxxxxxx \
+  --server-id 1783916711346432
+```
+
+The script should:
+
+1. Install Docker if missing.
+2. Pull Agent image.
+3. Stop old Agent if exists.
+4. Start new Agent container.
+5. Save config to `/opt/auto-ip-agent/.env`.
+6. Print Agent status.
+7. Test registration.
+
+---
+
+## 20. Docker Compose
+
+### Controller docker-compose.yml
+
+```yaml
+services:
+  auto-ip-rotator:
+    image: ghcr.io/OWNER/auto-ip-rotator:latest
+    container_name: auto-ip-rotator
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "${APP_PORT:-8080}:8080"
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+```
+
+### Agent docker-compose.yml
+
+```yaml
+services:
+  auto-ip-agent:
+    image: ghcr.io/OWNER/auto-ip-agent:latest
+    container_name: auto-ip-agent
+    restart: unless-stopped
+    environment:
+      CONTROLLER_URL: "${CONTROLLER_URL}"
+      AGENT_TOKEN: "${AGENT_TOKEN}"
+      SERVER_ID: "${SERVER_ID}"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+```
+
+Docker socket mount should be optional.
+
+If enabled, Agent can inspect containers.
+
+If disabled, Agent only reports system network status.
+
+---
+
+## 21. Configuration Defaults
+
+`.env.example` for Controller:
+
+```env
+APP_ENV=production
+APP_PORT=8080
+PUBLIC_URL=http://127.0.0.1:8080
+
+ADMIN_USERNAME=admin
+ADMIN_PASSWORD=change_me
+JWT_SECRET=change_me
+APP_ENCRYPTION_KEY=change_me_32_bytes_random_string
+
+DB_DRIVER=sqlite
+DB_PATH=/app/data/app.db
+
+AUTO_ROTATE_GLOBAL_ENABLED=false
+CHECK_INTERVAL_SECONDS=300
+FAILURE_THRESHOLD=3
+SUCCESS_RECOVERY_THRESHOLD=2
+ROTATION_COOLDOWN_MINUTES=30
+CHANGE_IP_WAIT_SECONDS=180
+CHANGE_IP_POLL_TIMEOUT_SECONDS=600
+MAX_ROTATIONS_PER_DAY=10
+REQUIRE_CONFIRMATION_CHECK=true
+
+TELEGRAM_ENABLED=false
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_CHAT_ID=
+
+LOG_LEVEL=info
+```
+
+Agent `.env`:
+
+```env
+CONTROLLER_URL=https://rotator.example.com
+AGENT_TOKEN=air_xxxxxxxxxxxxxxxxx
+SERVER_ID=1783916711346432
+HEARTBEAT_INTERVAL_SECONDS=30
+TASK_POLL_INTERVAL_SECONDS=15
+```
+
+---
+
+## 22. Notification System
+
+Support Telegram.
+
+Notifications:
+
+```text
+Agent online
+Agent offline
+Machine suspect
+Machine blocked
+IP rotation started
+IP rotation completed
+IP rotation failed
+DNS sync completed
+DNS sync failed
+Daily rotation limit reached
+```
+
+Telegram example:
+
+```text
+⚠️ 机器疑似不可达
+
+机器：Tokyo AWS VPS 1
+机器ID：1783916711346432
+当前IP：13.115.96.246
+失败次数：3
+检测来源：Controller TCP 443 / External HK Probe
+时间：2026-06-29 12:00
+```
+
+IP changed:
+
+```text
+✅ 自动换 IP 完成
+
+机器：Tokyo AWS VPS 1
+机器ID：1783916711346432
+旧IP：13.115.96.246
+新IP：18.183.xxx.xxx
+DNS同步：成功
+后置检测：通过
+```
+
+---
+
+## 23. Frontend Requirements
+
+Use:
+
+```text
+React
+TypeScript
+Vite
+Tailwind CSS or shadcn/ui
+WebSocket
+```
+
+Frontend must include:
+
+```text
+Login page
+Overview
+Provider panel config
+Machine list
+Agent install page
+Probe config
+DNS sync config
+Rotation history
+Logs
+Settings
+```
+
+UI must be clean and professional.
+
+Important:
+
+Secrets must never be displayed after saving.
+
+Use masked tokens only.
+
+---
+
+## 24. Backend Requirements
+
+Preferred language:
+
+```text
+Go
+```
+
+Recommended packages:
+
+```text
+Gin or Fiber
+SQLite
+GORM or sqlc
+JWT auth
+WebSocket
+zap/logrus structured logging
+```
+
+Alternative acceptable:
+
+```text
+Node.js + Fastify
+```
+
+The backend must include:
+
+```text
+Provider client
+DNS provider interface
+Cloudflare DNS implementation
+Generic webhook DNS implementation
+Agent manager
+Scheduler
+Probe runner
+Rotation job manager
+WebSocket hub
+Notification manager
+Encrypted secret storage
+```
+
+---
+
+## 25. Provider Client Interface
+
+```go
+type ProviderClient interface {
+    ListMachines(ctx context.Context) ([]Machine, error)
+    GetMachine(ctx context.Context, machineID string) (*Machine, error)
+    ChangeIP(ctx context.Context, machineID string) error
+}
+```
+
+Implementation for current panel:
+
+```text
+POST /lb/lightsail/page
+POST /lb/lightsail/changeIp
+```
+
+Important:
+
+```text
+Authorization header should be raw token, not Bearer token by default.
+Machine ID must be string.
+Never log full token.
+```
+
+---
+
+## 26. DNS Provider Interface
+
+```go
+type DNSProvider interface {
+    SyncARecord(ctx context.Context, record DNSRecord, ip string) error
+    SyncAAAARecord(ctx context.Context, record DNSRecord, ipv6 string) error
+}
+```
+
+Cloudflare first.
+
+Generic webhook second.
+
+Future:
+
+```text
+DNSPod
+AliDNS
+Route53
+```
+
+---
+
+## 27. Rotation Safety Rules
+
+Default:
+
+```text
+Auto rotation disabled globally
+Auto rotation disabled per machine
+DNS sync disabled by default
+Confirmation check enabled
+Cooldown enabled
+Daily limit enabled
+```
+
+A rotation can happen only if:
+
+```text
+Global auto rotation enabled
+Machine auto rotation enabled
+Failure threshold reached
+Confirmation check failed
+Cooldown passed
+Daily limit not reached
+No existing rotation job running for this machine
+Provider API is available
+```
+
+---
+
+## 28. Logging Requirements
+
+Use structured logs.
+
+Example:
+
+```json
+{
+  "level": "info",
+  "machineId": "1783916711346432",
+  "job": "rotate_ip",
+  "message": "IP rotation completed",
+  "oldIp": "13.115.96.246",
+  "newIp": "18.183.xxx.xxx",
+  "time": "2026-06-29T12:00:00Z"
+}
+```
+
+Never log:
+
+```text
+Provider token
+DNS token
+Telegram token
+Agent token
+JWT secret
+Encryption key
+```
+
+---
+
+## 29. Error Handling
+
+Handle:
+
+```text
+Invalid provider token
+Provider API timeout
+Machine ID not found
+Provider returned unknown response format
+Change IP succeeded but IP did not change
+DNS record not found
+DNS API permission denied
+Agent offline
+Agent token revoked
+Probe timeout
+WebSocket disconnect
+Database locked
+Duplicate rotation job
+Too many rotations per day
+```
+
+---
+
+## 30. MVP Development Phases
+
+### Phase 1: Controller Basic
+
+```text
+Login
+SQLite
+Provider panel config
+Encrypted token storage
+Test provider connection
+Sync machine list
+Machine list UI
+Manual change IP
+Rotation history
+Logs
+```
+
+### Phase 2: Agent
+
+```text
+Generate Agent token
+Generate install command
+Agent register
+Agent heartbeat
+Agent status UI
+Agent task polling
+Agent local probe
+```
+
+### Phase 3: Probe and Auto Rotation
+
+```text
+TCP probe
+HTTP probe
+Probe config UI
+Scheduler
+Failure threshold
+Confirmation check
+Cooldown
+Daily rotation limit
+Auto rotation
+```
+
+### Phase 4: DNS Sync
+
+```text
+Cloudflare DNS provider
+DNS config UI
+Manual DNS sync
+Sync DNS after IP rotation
+DNS sync logs
+Generic webhook DDNS
+```
+
+### Phase 5: WebSocket and Professional UI
+
+```text
+Live machine status
+Live probe results
+Live logs
+Toast notifications
+Charts
+Dark/light mode
+```
+
+### Phase 6: External Probe Nodes
+
+```text
+External probe agent mode
+Probe region labels
+Multi-region weighted detection
+China/HK/JP/US probe support
+```
+
+---
+
+## 31. Acceptance Criteria
+
+The project is complete when:
+
+1. Controller can be deployed with Docker Compose.
+2. Admin can log into dashboard.
+3. Admin can add provider panel URL and token from web UI.
+4. Admin can test provider connection.
+5. Admin can sync machines from provider panel.
+6. Admin can manually add machine ID.
+7. Admin can generate Agent install command for a machine.
+8. Agent can be installed on AWS VPS using one command.
+9. Agent registers successfully.
+10. Dashboard shows Agent online/offline status.
+11. Dashboard shows machine current IP.
+12. Dashboard can manually change IP through provider API.
+13. Rotation history records old IP and new IP.
+14. Probe rules can be configured from dashboard.
+15. Scheduler can run probes automatically.
+16. Auto rotation only triggers after threshold and confirmation.
+17. Cooldown prevents repeated IP changes.
+18. Cloudflare DNS sync can be configured from dashboard.
+19. DNS records update after IP rotation when enabled.
+20. WebSocket updates dashboard in real time.
+21. Telegram notifications work.
+22. Secrets are encrypted or safely stored.
+23. Tokens are masked in logs and UI.
+24. `.env` is not committed.
+25. README explains deployment and security.
+
+---
+
+## 32. README Requirements
+
+README must include:
+
+```text
+Project introduction
+Architecture diagram
+Controller installation
+Agent installation
+Provider panel setup
+Machine setup
+Probe setup
+DNS/DDNS setup
+Telegram setup
+Manual IP change
+Auto IP rotation
+Safety rules
+Upgrade guide
+Troubleshooting
+Security warnings
+```
+
+Troubleshooting must cover:
+
+```text
+Agent cannot register
+Provider token invalid
+Machine ID not found
+IP does not change
+DNS sync failed
+Dashboard WebSocket disconnected
+Docker container not starting
+```
+
+---
+
+## 33. Important Implementation Notes
+
+1. Do not hardcode any real token.
+2. Do not put user token in README examples.
+3. Do not treat machine ID as integer.
+4. Use string for machine ID.
+5. The provider Authorization header should be raw token by default.
+6. The Agent should not know provider panel token.
+7. DNS sync is optional and disabled by default.
+8. Auto rotation is disabled by default.
+9. The frontend must not receive real secrets after saving.
+10. The generated Agent command must use an Agent token, not the provider token.
+11. The Controller should be the only component that calls provider API and DNS API.
+12. The Agent should only report and execute safe local checks.
+13. Add audit logs for every manual IP change.
+14. Add confirmation for manual IP change in UI.
+15. Add cooldown and daily limit for auto rotation.
+16. Add WebSocket reconnect logic in frontend.
+17. Add health check endpoint:
+
+```http
+GET /healthz
+```
+
+18. Add version endpoint:
+
+```http
+GET /api/version
+```
+
+---
+
+## 34. Example User Workflow
+
+```text
+1. User deploys Controller.
+2. User opens dashboard.
+3. User adds provider panel:
+   API Base: https://aws.linus.us.kg
+   Token: ********
+4. User clicks Test Connection.
+5. User clicks Sync Machines.
+6. Dashboard shows machine:
+   ID: 1783916711346432
+   IP: 13.115.96.246
+   Region: Tokyo
+7. User opens machine detail.
+8. User clicks Generate Agent.
+9. Dashboard shows one-line install command.
+10. User runs command on AWS VPS.
+11. Agent registers.
+12. Dashboard shows Agent Online.
+13. User configures TCP 443 and HTTPS probes.
+14. User optionally configures Cloudflare DNS record.
+15. User manually tests Change IP.
+16. Old IP and new IP are recorded.
+17. DNS record updates automatically if enabled.
+18. User enables auto rotation after confirming probes work.
+```
+
+---
+
+## 35. Final Objective
+
+Build a professional Controller + Agent based Auto IP Rotation Platform.
+
+The platform must be easy to operate from a web dashboard:
+
+```text
+Configure panel credentials in web UI
+Generate Agent install command
+Install Agent on VPS
+Monitor connectivity
+Rotate IP safely
+Synchronize DNS optionally
+Show live WebSocket status
+Send notifications
+Keep secrets secure
+```
+
+The result should be more reliable and safer than a shell script.
