@@ -30,4 +30,5 @@ jobs:
           sudo apt-get update && sudo apt-get install -y shellcheck
           sh -n install-controller.sh
           sh -n install-agent.sh
-          shellcheck -s sh install-controller.sh install-agent.sh
+          shellcheck -s sh install-controller.sh install-agent.sh scripts/test-installer.sh
+          sh scripts/test-installer.sh

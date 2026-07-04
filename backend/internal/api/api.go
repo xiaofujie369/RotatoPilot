@@ -30,7 +30,7 @@ import (
 	"github.com/xiaofujie369/RotatoPilot/backend/internal/store"
 )
 
-const Version = "1.0.0"
+const Version = "1.1.0"
 
 type API struct {
 	Cfg       config.Config
