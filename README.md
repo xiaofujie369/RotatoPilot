@@ -30,7 +30,7 @@ cp .env.example .env
 docker compose up -d --build
 ```
 
-Open `http://SERVER_IP:8080`. For a server install that generates secrets interactively, download the script first so it can be inspected before running as root:
+For the recommended installation with automatic domain reverse proxy and HTTPS, download the script first so it can be inspected before running as root:
 
 ```bash
 curl --proto '=https' --tlsv1.2 -fsSL \
@@ -39,7 +39,15 @@ curl --proto '=https' --tlsv1.2 -fsSL \
   && sudo sh /tmp/install-rotatopilot.sh
 ```
 
-Use a TLS reverse proxy (Caddy, Nginx, or a trusted load balancer) before exposing the dashboard publicly. Set `PUBLIC_URL` to the final HTTPS origin.
+The installer asks for a domain rather than a URL and derives the HTTPS `PUBLIC_URL` internally. Existing installations are upgraded in place: administrator login data, security configuration, Telegram settings, and the SQLite volume are preserved and timestamped configuration backups are created.
+
+### Automatic domain and HTTPS modes
+
+- **Direct Caddy:** selected automatically when host ports 80 and 443 are free. The installer starts Caddy, requests a publicly trusted certificate, redirects HTTP to HTTPS, and proxies the domain to the controller. The domain must already resolve to the server.
+- **Cloudflare Tunnel:** selected automatically when 80 or 443 is occupied, such as by Xray. It does not listen on the host's 80/443 ports. Supply a Cloudflare API Token and Zone ID; the installer creates or reuses a remotely managed tunnel, configures ingress, replaces the domain's conflicting A/AAAA/CNAME record, obtains the tunnel token, and starts `cloudflared`. Cloudflare serves the public certificate.
+- **No HTTPS:** an advanced fallback that exposes the configured controller port directly. Do not use it over an untrusted network.
+
+For automatic Tunnel setup, the Cloudflare API Token needs Zone Read, DNS Write, and Cloudflare Tunnel/Connector Write permissions. Cloudflare recommends remotely managed tunnels for most deployments, and Tunnel connections are outbound-only, so an existing Xray listener on 443 remains untouched.
 
 ## Host compatibility
 
