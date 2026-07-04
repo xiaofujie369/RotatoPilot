@@ -92,7 +92,9 @@ else
 fi
 
 case "$PORT" in ''|*[!0-9]*) die "APP_PORT must be numeric" ;; esac
-[ "$PORT" -ge 1 ] 2>/dev/null && [ "$PORT" -le 65535 ] 2>/dev/null || die "APP_PORT must be between 1 and 65535"
+if [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
+  die "APP_PORT must be between 1 and 65535"
+fi
 case "$USER_NAME" in ''|*[!A-Za-z0-9_.-]*) die "ADMIN_USERNAME contains unsupported characters" ;; esac
 [ "${#PASS}" -ge 12 ] || die "ADMIN_PASSWORD must contain at least 12 characters"
 case "$PASS" in *"'"*|*"

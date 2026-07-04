@@ -23,7 +23,9 @@ done
 [ "$(uname -s 2>/dev/null || true)" = "Linux" ] || die "Only Linux hosts are supported"
 [ "$(id -u)" -eq 0 ] || die "Run this installer as root (for example: sudo sh install-agent.sh ...)"
 case "$(uname -m)" in x86_64|amd64) PLATFORM=amd64 ;; aarch64|arm64) PLATFORM=arm64 ;; *) die "Unsupported CPU architecture: $(uname -m)" ;; esac
-[ -n "$CONTROLLER" ] && [ -n "$TOKEN" ] && [ -n "$SERVER_ID" ] || die "Usage: install-agent.sh --controller URL --agent-token TOKEN --server-id ID"
+if [ -z "$CONTROLLER" ] || [ -z "$TOKEN" ] || [ -z "$SERVER_ID" ]; then
+  die "Usage: install-agent.sh --controller URL --agent-token TOKEN --server-id ID"
+fi
 case "$CONTROLLER" in
   https://*) ;;
   http://127.0.0.1:*|http://localhost:*|http://\[::1\]:*) ;;
